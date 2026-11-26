@@ -17,6 +17,7 @@
 #include <vtkPolyDataMapper.h>
 #include <vtkActor.h>
 #include <vtkProperty.h>
+#include <vtkCamera.h>
 #include <vtkRenderer.h>
 #include <vtkRenderWindow.h>
 #include <vtkRenderWindowInteractor.h>
@@ -31,16 +32,23 @@ int main(int argc, char* argv[])
   if (argc < 3)
   {
     std::cout << "Uso: " << argv[0]
-              << " image.mhd linea_central.vtk [umbral] [dist_mm]\n"
-              << "  umbral  : valor de la isosuperficie. Si se omite o es 0,\n"
-              << "            se usa la mitad de la intensidad en la arteria.\n"
-              << "  dist_mm : si es mayor que 0, deja solo la superficie a esa\n"
-              << "            distancia de la linea central, calcula el radio y\n"
-              << "            colorea el tubo por estrechamiento (paso 1, B y C).\n"
-              << "            Si se omite o es 0, muestra la superficie cruda (checkpoint 0).\n"
+              << " image.mhd linea_central.vtk [umbral] [dist_mm] [umbral_corazon] [umbral_calcio]\n"
+              << "  umbral         : valor de la isosuperficie. Si se omite o es 0,\n"
+              << "                   se usa la mitad de la intensidad en la arteria.\n"
+              << "  dist_mm        : si es mayor que 0, aisla la arteria, calcula el radio\n"
+              << "                   y colorea el tubo por estrechamiento.\n"
+              << "                   Si se omite o es 0, muestra el checkpoint 0.\n"
+              << "  umbral_corazon : si es mayor que 0, dibuja ademas el corazon\n"
+              << "                   (sangre con contraste) con ese umbral.\n"
+              << "                   Si se omite o es 0, solo se ve la arteria.\n"
+              << "  umbral_calcio  : si es mayor que 0 (y dist_mm > 0), dibuja las\n"
+              << "                   calcificaciones cerca de la linea central.\n"
+              << "                   Debe ser claramente mayor que la intensidad de la arteria.\n"
               << "Ejemplos:\n"
               << "  " << argv[0] << " image.mhd Team_LKEB_ManuallyCorrected_vessel00.vtk\n"
-              << "  " << argv[0] << " image.mhd Team_LKEB_ManuallyCorrected_vessel00.vtk 0 6\n";
+              << "  " << argv[0] << " image.mhd Team_LKEB_ManuallyCorrected_vessel00.vtk 0 6\n"
+              << "  " << argv[0] << " image.mhd Team_LKEB_ManuallyCorrected_vessel00.vtk 0 6 250\n"
+              << "  " << argv[0] << " image.mhd Team_LKEB_ManuallyCorrected_vessel00.vtk 0 6 0 600\n";
     return 1;
   }
 
@@ -81,7 +89,31 @@ int main(int argc, char* argv[])
 
   double umbral = (argc > 3 && std::atof(argv[3]) > 0) ? std::atof(argv[3]) : lumen * 0.5;
   double dist = (argc > 4) ? std::atof(argv[4]) : 0.0;
+  // El corazon solo se dibuja si se da un umbral para el en el quinto argumento
+  double umbralCorazon = (argc > 5) ? std::atof(argv[5]) : 0.0;
+  bool conCorazon = (dist > 0 && umbralCorazon > 0);
+  // Las calcificaciones solo se dibujan si se da un umbral en el sexto argumento
+  double umbralCalcio = (argc > 6) ? std::atof(argv[6]) : 0.0;
+  bool conCalcio = (dist > 0 && umbralCalcio > 0);
   std::cout << "Umbral: " << umbral << "\n";
+  if (conCalcio && umbralCalcio <= lumen)
+  {
+    std::cout << "Aviso: el umbral de calcio (" << umbralCalcio
+              << ") no supera la intensidad de la arteria (" << lumen
+              << "). Probablemente se vera toda la arteria como calcio.\n";
+  }
+
+  // Pasa una caja en mm (la de la linea central mas un margen) a indices de voxel
+  auto cajaVoxel = [&](double margen, int voi[6])
+  {
+    for (int d = 0; d < 3; ++d)
+    {
+      int lo = (int)std::floor((cb[2 * d] - margen - org[d]) / sp[d]);
+      int hi = (int)std::ceil((cb[2 * d + 1] + margen - org[d]) / sp[d]);
+      voi[2 * d] = std::max(lo, ext[2 * d]);
+      voi[2 * d + 1] = std::min(hi, ext[2 * d + 1]);
+    }
+  };
 
   // ------------------------------------------------------------------
   // Marching Cubes. Con dist > 0 se aplica antes sobre un volumen recortado.
@@ -93,16 +125,8 @@ int main(int argc, char* argv[])
   auto crop = vtkSmartPointer<vtkExtractVOI>::New();
   if (dist > 0)
   {
-    // Caja de la linea central mas 15 mm de margen, pasada a indices de voxel
-    const double margen = 15.0;
     int voi[6];
-    for (int d = 0; d < 3; ++d)
-    {
-      int lo = (int)std::floor((cb[2 * d] - margen - org[d]) / sp[d]);
-      int hi = (int)std::ceil((cb[2 * d + 1] + margen - org[d]) / sp[d]);
-      voi[2 * d] = std::max(lo, ext[2 * d]);
-      voi[2 * d + 1] = std::min(hi, ext[2 * d + 1]);
-    }
+    cajaVoxel(15.0, voi);
     crop->SetInputData(img);
     crop->SetVOI(voi);
     mc->SetInputConnection(crop->GetOutputPort());
@@ -215,6 +239,83 @@ int main(int argc, char* argv[])
   }
 
   // ------------------------------------------------------------------
+  // Calcificaciones (opcional). Isosuperficie alta cerca de la linea central.
+  // Reusa el locator de la linea central construido en el bloque anterior.
+  // ------------------------------------------------------------------
+  auto cropC = vtkSmartPointer<vtkExtractVOI>::New();
+  auto mcC = vtkSmartPointer<vtkMarchingCubes>::New();
+  auto conDistC = vtkSmartPointer<vtkPolyData>::New();
+  auto clipC = vtkSmartPointer<vtkClipPolyData>::New();
+
+  if (conCalcio)
+  {
+    int voiC[6];
+    cajaVoxel(15.0, voiC);
+    cropC->SetInputData(img);
+    cropC->SetVOI(voiC);
+
+    mcC->SetInputConnection(cropC->GetOutputPort());
+    mcC->SetValue(0, umbralCalcio);
+    mcC->ComputeNormalsOn();
+    mcC->Update();
+    vtkPolyData* calcioCrudo = mcC->GetOutput();
+
+    // Distancia de cada vertice a la linea central
+    auto dC = vtkSmartPointer<vtkFloatArray>::New();
+    dC->SetName("distancia");
+    for (vtkIdType n = 0; n < calcioCrudo->GetNumberOfPoints(); ++n)
+    {
+      double p[3], q[3];
+      calcioCrudo->GetPoint(n, p);
+      cl->GetPoint(locator->FindClosestPoint(p), q);
+      dC->InsertNextValue((float)std::sqrt(vtkMath::Distance2BetweenPoints(p, q)));
+    }
+    conDistC->ShallowCopy(calcioCrudo);
+    conDistC->GetPointData()->SetScalars(dC);
+
+    // Se conserva solo lo que esta a menos de dist mm (descarta huesos, valvulas, etc.)
+    clipC->SetInputData(conDistC);
+    clipC->SetValue(dist);
+    clipC->InsideOutOn();
+    clipC->GenerateClipScalarsOff();
+    clipC->Update();
+    std::cout << "Umbral del calcio: " << umbralCalcio << "\n";
+    std::cout << "Triangulos de calcio: " << clipC->GetOutput()->GetNumberOfPolys() << "\n";
+  }
+
+  // ------------------------------------------------------------------
+  // Corazon de contexto (opcional). Mismo recorrido que la arteria, pero con
+  // una caja de 60 mm de margen y sin recorte por distancia.
+  // Solo se ve la sangre con contraste (aorta y cavidades conectadas).
+  // ------------------------------------------------------------------
+  auto cropH = vtkSmartPointer<vtkExtractVOI>::New();
+  auto mcH = vtkSmartPointer<vtkMarchingCubes>::New();
+  auto connH = vtkSmartPointer<vtkPolyDataConnectivityFilter>::New();
+  double cajaVista[6] = {cb[0], cb[1], cb[2], cb[3], cb[4], cb[5]};
+
+  if (conCorazon)
+  {
+    int voiH[6];
+    cajaVoxel(60.0, voiH);
+    cropH->SetInputData(img);
+    cropH->SetVOI(voiH);
+
+    mcH->SetInputConnection(cropH->GetOutputPort());
+    mcH->SetValue(0, umbralCorazon);
+    mcH->ComputeNormalsOn();
+
+    connH->SetInputConnection(mcH->GetOutputPort());
+    connH->SetExtractionModeToClosestPointRegion();
+    connH->SetClosestPoint(pMid);
+    connH->Update();
+    std::cout << "Umbral del corazon: " << umbralCorazon << "\n";
+    std::cout << "Triangulos del corazon: " << connH->GetOutput()->GetNumberOfPolys() << "\n";
+
+    // La camara mira al centro del corazon, no al de la arteria
+    connH->GetOutput()->GetBounds(cajaVista);
+  }
+
+  // ------------------------------------------------------------------
   // Actores
   // ------------------------------------------------------------------
   auto sMapper = vtkSmartPointer<vtkPolyDataMapper>::New();
@@ -225,9 +326,23 @@ int main(int argc, char* argv[])
   sActor->GetProperty()->SetColor(0.85, 0.35, 0.30);
   sActor->GetProperty()->SetOpacity(dist > 0 ? 0.25 : 0.3);
 
-  auto ren = vtkSmartPointer<vtkRenderer>::New();
-  ren->AddActor(sActor);
-  ren->SetBackground(0.25, 0.25, 0.30);
+  // Corazon, superficie muy transparente de otro color para no confundirla
+  auto hMapper = vtkSmartPointer<vtkPolyDataMapper>::New();
+  hMapper->SetInputConnection(connH->GetOutputPort());
+  hMapper->ScalarVisibilityOff();
+  auto hActor = vtkSmartPointer<vtkActor>::New();
+  hActor->SetMapper(hMapper);
+  hActor->GetProperty()->SetColor(0.80, 0.80, 0.85);
+  hActor->GetProperty()->SetOpacity(0.08);
+
+  // Calcificaciones, opacas y de color claro para que contrasten con la pared
+  auto calMapper = vtkSmartPointer<vtkPolyDataMapper>::New();
+  calMapper->SetInputConnection(clipC->GetOutputPort());
+  calMapper->ScalarVisibilityOff();
+  auto calActor = vtkSmartPointer<vtkActor>::New();
+  calActor->SetMapper(calMapper);
+  calActor->GetProperty()->SetColor(1.0, 0.95, 0.85);
+  calActor->GetProperty()->SetOpacity(1.0);
 
   // Paso C. Tubo coloreado por estrechamiento (solo si se aislo la arteria)
   auto clS = vtkSmartPointer<vtkPolyData>::New();
@@ -237,6 +352,9 @@ int main(int argc, char* argv[])
   auto tActor = vtkSmartPointer<vtkActor>::New();
   auto cMapper = vtkSmartPointer<vtkPolyDataMapper>::New();
   auto cActor = vtkSmartPointer<vtkActor>::New();
+
+  // Actor de la linea central. Es el tubo coloreado o la linea amarilla
+  vtkActor* lineaActor = nullptr;
 
   if (dist > 0)
   {
@@ -261,7 +379,7 @@ int main(int argc, char* argv[])
     tMapper->SetScalarRange(0.0, 1.0);
     tMapper->ScalarVisibilityOn();
     tActor->SetMapper(tMapper);
-    ren->AddActor(tActor);
+    lineaActor = tActor;
   }
   else
   {
@@ -270,8 +388,30 @@ int main(int argc, char* argv[])
     cActor->SetMapper(cMapper);
     cActor->GetProperty()->SetColor(1.0, 0.9, 0.1);
     cActor->GetProperty()->SetLineWidth(3.0);
-    ren->AddActor(cActor);
+    lineaActor = cActor;
   }
+
+  // ------------------------------------------------------------------
+  // Una sola vista, con camara oblicua que luego se mueve con el mouse
+  // ------------------------------------------------------------------
+  auto ren = vtkSmartPointer<vtkRenderer>::New();
+  ren->SetBackground(0.25, 0.25, 0.30);
+  if (conCorazon) ren->AddActor(hActor);   // primero el corazon
+  ren->AddActor(sActor);
+  if (conCalcio) ren->AddActor(calActor);  // calcio antes de la linea central
+  ren->AddActor(lineaActor);
+
+  double centro[3] = {
+    0.5 * (cajaVista[0] + cajaVista[1]),
+    0.5 * (cajaVista[2] + cajaVista[3]),
+    0.5 * (cajaVista[4] + cajaVista[5])
+  };
+  vtkCamera* cam = ren->GetActiveCamera();
+  cam->SetFocalPoint(centro);
+  cam->SetPosition(centro[0] + 1, centro[1] - 1, centro[2] + 1);
+  cam->SetViewUp(0, 0, 1);
+  // ResetCamera aleja la camara lo necesario para que todo quepa
+  ren->ResetCamera();
 
   auto win = vtkSmartPointer<vtkRenderWindow>::New();
   win->AddRenderer(ren);
